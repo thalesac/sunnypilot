@@ -20,24 +20,16 @@ MAX_ACCEL_PROFILES = {
 }
 MAX_ACCEL_BREAKPOINTS = [0.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0, 32.0, 42.0]
 
-# Exponential decel floor: authority fades with speed, smooth by construction.
-# base * exp(-k * v_ego). MPC (COMFORT_BRAKE, A_CHANGE_COST) owns hard braking above this.
+# Static decel floor per personality. MPC (COMFORT_BRAKE, A_CHANGE_COST) owns all
+# brake feel shaping above this. This is a safety clip
 MIN_ACCEL_BASE = {
-  AccelPersonality.eco:    -0.52,
-  AccelPersonality.normal: -0.80,
-  AccelPersonality.sport:  -1.15,
+  AccelPersonality.eco:    -0.40,
+  AccelPersonality.normal: -0.62,
+  AccelPersonality.sport:  -0.95,
 }
-MIN_ACCEL_DECAY = 0.030  # same decay rate for all personalities
+MIN_ACCEL_DECAY = 0.030  # authority fades with speed: base * exp(-k * v_ego)
 
-JERK_ACCEL = 0.55  # accel ceiling symmetric rate (m/s² per s)
-
-# fast at standstill, very slow at highway
-_DECEL_ON_BP = [0.0,  8.0,  18.0,  32.0]
-_DECEL_ON_V  = [0.28, 0.18,  0.12,  0.08]  # m/s² per s
-
-# always slower — prevents nose-bob
-_DECEL_OFF_BP = [0.0,  8.0,  18.0,  32.0]
-_DECEL_OFF_V  = [0.14, 0.09,  0.06,  0.05]  # m/s² per s
+JERK_ACCEL = 0.55  # accel ceiling rate-limit (m/s² per s) — max only, not decel
 
 _MIN_MAX_GAP = 0.05
 
@@ -48,7 +40,6 @@ class AccelPersonalityController:
     self.frame = 0
     self.first_run = True
     self.last_max_accel = 2.0
-    self.last_min_accel = 0.0
     self._cache_v: float | None = None
     self._cache_min: float = 0.0
     self._cache_max: float = 2.0
@@ -86,26 +77,20 @@ class AccelPersonalityController:
 
   def _step(self, v_ego: float) -> tuple[float, float]:
     target_max = float(np.interp(v_ego, MAX_ACCEL_BREAKPOINTS, MAX_ACCEL_PROFILES[self._accel_personality]))
-    target_min = float(MIN_ACCEL_BASE[self._accel_personality] * np.exp(-MIN_ACCEL_DECAY * v_ego))
 
     if self.first_run:
       self.last_max_accel = target_max
-      self.last_min_accel = target_min
       self.first_run = False
-      return target_min, target_max
+    else:
+      a_step = JERK_ACCEL * DT_MDL
+      target_max = float(np.clip(target_max, self.last_max_accel - a_step, self.last_max_accel + a_step))
+      self.last_max_accel = target_max
 
-    a_step = JERK_ACCEL * DT_MDL
-    new_max = float(np.clip(target_max, self.last_max_accel - a_step, self.last_max_accel + a_step))
+    # Static floor — no rate limiting, MPC owns brake feel
+    min_accel = float(MIN_ACCEL_BASE[self._accel_personality] * np.exp(-MIN_ACCEL_DECAY * v_ego))
+    min_accel = min(min_accel, target_max - _MIN_MAX_GAP)
 
-    tightening = target_min < self.last_min_accel
-    d_rate = float(np.interp(v_ego, _DECEL_ON_BP, _DECEL_ON_V)) if tightening \
-         else float(np.interp(v_ego, _DECEL_OFF_BP, _DECEL_OFF_V))
-    new_min = float(np.clip(target_min, self.last_min_accel - d_rate * DT_MDL, self.last_min_accel + d_rate * DT_MDL))
-    new_min = min(new_min, new_max - _MIN_MAX_GAP)
-
-    self.last_max_accel = new_max
-    self.last_min_accel = new_min
-    return new_min, new_max
+    return min_accel, target_max
 
   def get_accel_limits(self, v_ego: float) -> tuple[float, float]:
     v_ego = max(0.0, v_ego)
@@ -138,6 +123,5 @@ class AccelPersonalityController:
     self.params.put('AccelPersonality', new_p)
     self.frame = 0
     self.last_max_accel = 2.0
-    self.last_min_accel = 0.0
     self._cache_v = None
     self.first_run = True
